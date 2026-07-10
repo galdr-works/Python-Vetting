@@ -1,9 +1,12 @@
-Python Vetting
+# pyvet — Vetting Python Packages for Offline / Closed Networks
+
 > A repeatable, auditable process for pulling Python packages onto a closed / air-gapped network with integrity, provenance, and security guarantees baked in.
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Repository Layout](#repository-layout)
+- [Setup: Installing the Toolchain (`scripts/pyvet.bash`)](#setup-installing-the-toolchain-scriptspyvetbash)
 - [The Process](#the-process)
   1. [Pin (`pip-compile`)](#1-pin-pip-compile)
   2. [Fetch (`pip download`)](#2-fetch-pip-download-with-hash-verification)
@@ -16,31 +19,55 @@ Python Vetting
   9. [Guarddog (malicious behavior detection)](#9-guarddog-malicious-package-behavioral-detection)
   10. [Scorecard (supply chain health)](#10-scorecard-supply-chain-health)
   11. [Verdict](#11-verdict)
+- [Verdict Record Template (`docs/`)](#verdict-record-template-docs)
 - [Example Run: PyYAML](#example-run-pyyaml)
 
 ## Overview
 
 Our organization runs on a closed, restricted network with no direct internet access. We're migrating to Python more heavily across teams, but until now we haven't had a consistent way to control what packages get carried across the air gap, or to test and scan those packages for security issues before they land on the network.
 
-`pyvet` is the process (and eventually, tooling) we use to vet every Python package before it crosses that boundary.
+`pyvet` is the process (and tooling) we use to vet every Python package before it crosses that boundary.
 
 We're not reinventing the wheel here (pun intended) — plenty of best-in-class open source tools already do CVE scanning, SBOM generation, static analysis, and supply-chain scoring. `pyvet` is the glue: a fixed, auditable pipeline that runs those tools in the same order, every time, and produces a single go/no-go verdict per package.
 
-## The Process
+## Repository Layout
 
-| Step | Stage                | Tool                            | Repo                                       |
-| ---- | -------------------- | -------------------------------- | ------------------------------------------- |
-| 1    | Pin                   | `pip-compile`                    | https://github.com/jazzband/pip-tools       |
-| 2    | Fetch                 | `pip download` (hash-verified)   | https://github.com/pypa/pip                 |
-| 3    | Install               | isolated `venv`                  | — (Python standard library)                 |
-| 4    | SBOM                  | `syft`                           | https://github.com/anchore/syft             |
-| 5    | CVE scan              | `grype`                          | https://github.com/anchore/grype            |
-| 6    | Vulnerability audit   | `pip-audit`                      | https://github.com/pypa/pip-audit           |
-| 7    | Vulnerability audit   | `osv-scanner`                    | https://github.com/google/osv-scanner       |
-| 8    | Static analysis       | `bandit`                         | https://github.com/pycqa/bandit             |
-| 9    | Behavioral analysis   | `guarddog`                       | https://github.com/DataDog/guarddog         |
-| 10   | Supply chain health   | `scorecard`                      | https://github.com/ossf/scorecard           |
-| 11   | Decision              | verdict                          | — (internal)                                |
+```
+.
+├── README.md                          — this file: process, command reference, and worked example
+├── LICENSE                            — GPL-3.0
+├── docs/
+│   ├── PythonVettingTemplate.docx     — verdict record template (Word)
+│   └── PythonVettingTemplate.md       — same template, Markdown / GitHub-native version
+└── scripts/
+    └── pyvet.bash                     — bootstraps the scanning toolchain onto a fresh analyst machine
+```
+
+- **`README.md`** — start here. Explains *why* each step exists and gives the exact command/flags for each tool.
+- **`scripts/pyvet.bash`** — run once per analyst machine (or per re-provision) to install every tool the process depends on. See [Setup](#setup-installing-the-toolchain-scriptspyvetbash) below.
+- **`docs/PythonVettingTemplate.{docx,md}`** — the fill-in-the-blanks verdict record. One copy per package vetted. See [Verdict Record Template](#verdict-record-template-docs) below.
+
+## Setup: Installing the Toolchain (`scripts/pyvet.bash`)
+
+Before running Step 1 of the process, bootstrap the scanning toolchain with `scripts/pyvet.bash`. It installs and pins every tool the pipeline depends on — `pip-tools`, `syft`, `grype`, `pip-audit`, `osv-scanner`, `bandit`, `guarddog`, and `scorecard` — into an isolated location on the analyst machine, independent of system Python or package managers.
+
+```bash
+chmod +x scripts/pyvet.bash
+./scripts/pyvet.bash
+source ~/.bashrc
+```
+
+What it does:
+
+| Behavior | Detail |
+| --- | --- |
+| **Install location** | Binaries go to `~/.local/bin` (override with `PYVET_INSTALL_DIR`); Python-based tools (`pip-audit`, `bandit`, `guarddog`) install into a dedicated venv at `~/.local/share/pyvet/venv` (override with `PYVET_VENV_DIR`), not the system interpreter. |
+| **Integrity checking** | Anchore tools (`syft`, `grype`) are checksum-validated by default and cosign-signature-verified if `cosign` is present on the machine. GitHub-release binaries (`osv-scanner`, `scorecard`) are pulled via the GitHub API. Go-installed fallbacks are checksum-verified against `sum.golang.org`. |
+| **Reproducibility manifest** | Every installed tool's name, version, SHA-256, source URL, and install path is written to `~/.config/pyvet/toolchain.manifest.json`. Keep this alongside your findings records — it documents exactly what ran the scan. |
+| **Version pinning** | By default the script installs whatever is currently latest. For a reproducible install, export the matching `PYVET_*_VERSION` variable (e.g. `PYVET_GRYPE_VERSION=v0.114.0`) before running — use the values recorded in a previous run's manifest. |
+| **GitHub token handling** | The script prompts for a `GITHUB_AUTH_TOKEN` (see [GitHub Auth Token](#github-auth-token) below), stores it at `~/.config/pyvet/github.env` with `chmod 600`, and adds a `pyvet-auth` shell function to `~/.bashrc`. The token is **not** auto-loaded into every shell — run `pyvet-auth` to load it into your current shell right before you need it (e.g. before running `scorecard`). |
+
+Re-run the script any time you need to re-provision a machine or refresh the toolchain; it's idempotent and safe to run repeatedly.
 
 ### GitHub Auth Token
 
@@ -54,7 +81,13 @@ GitHub → Settings → Developer settings → Personal access tokens → Tokens
 
 Scope it to **public repo, read-only** and set an expiration date. This token only ever needs to read public repository metadata — it should never carry write or org-admin scopes.
 
-**2. Store it on your scanning machine.** Don't paste it directly into an interactive shell (it lands in plaintext in your shell history) and don't hardcode it into a script. Instead, drop it in a file outside any git-tracked directory and source it:
+**2. Store it via the setup script (recommended).** Running `scripts/pyvet.bash` prompts for the token interactively and stores it at `~/.config/pyvet/github.env` (`chmod 600`), loaded on demand via the `pyvet-auth` shell function it installs — nothing lands in your shell history and it isn't sourced into every session.
+
+```bash
+pyvet-auth   # loads GITHUB_AUTH_TOKEN into the current shell, right before you need it
+```
+
+**Manual alternative**, if you're not using the setup script: drop it in a file outside any git-tracked directory and source it yourself.
 
 ```bash
 echo 'export GITHUB_AUTH_TOKEN=<paste classic token here>' >> ~/.pyvet_env
@@ -62,9 +95,25 @@ chmod 600 ~/.pyvet_env
 source ~/.pyvet_env
 ```
 
-> **OPSEC:** Never commit `~/.pyvet_env` — or any file containing the token — to a repo, especially not the one you're about to push to GitHub. Add it to `.gitignore` before your first commit, rotate the token periodically, and revoke it immediately if this machine changes hands.
+> **OPSEC:** Never commit `~/.pyvet_env`, `~/.config/pyvet/github.env` — or any file containing the token — to a repo, especially not this one. Both are outside the git-tracked directory by design; keep it that way, rotate the token periodically, and revoke it immediately if this machine changes hands.
 
 ---
+
+## The Process
+
+| Step | Stage | Tool | Repo |
+| ---- | ------------------- | ------------------------------- | --------------------------------------- |
+| 1 | Pin | `pip-compile` | <https://github.com/jazzband/pip-tools> |
+| 2 | Fetch | `pip download` (hash-verified) | <https://github.com/pypa/pip> |
+| 3 | Install | isolated `venv` | — (Python standard library) |
+| 4 | SBOM | `syft` | <https://github.com/anchore/syft> |
+| 5 | CVE scan | `grype` | <https://github.com/anchore/grype> |
+| 6 | Vulnerability audit | `pip-audit` | <https://github.com/pypa/pip-audit> |
+| 7 | Vulnerability audit | `osv-scanner` | <https://github.com/google/osv-scanner> |
+| 8 | Static analysis | `bandit` | <https://github.com/pycqa/bandit> |
+| 9 | Behavioral analysis | `guarddog` | <https://github.com/DataDog/guarddog> |
+| 10 | Supply chain health | `scorecard` | <https://github.com/ossf/scorecard> |
+| 11 | Decision | verdict | — (internal) |
 
 ### 1. Pin (`pip-compile`)
 
@@ -142,9 +191,9 @@ syft ~/[PackageName]/venv \
 
 ### 5. `grype` (CVE scanning)
 
-grype takes the SBOM you just generated and cross-references every package against its vulnerability database — NVD, GitHub Advisory Database, and several others. It's looking for _known vulnerabilities in legitimate packages_. This is one half of your two-threat-class model. The other half (malicious packages) comes from guarddog shortly after.
+grype takes the SBOM you just generated and cross-references every package against its vulnerability database — NVD, GitHub Advisory Database, and several others. It's looking for *known vulnerabilities in legitimate packages*. This is one half of your two-threat-class model. The other half (malicious packages) comes from guarddog shortly after.
 
-The distinction is worth restating explicitly: a CVE scanner cannot tell you whether a package is malicious. It can only tell you whether a legitimate package has a known vulnerability. A perfectly clean grype result does not mean a package is safe — it means it has no _known CVEs_. That's why both tool categories exist.
+The distinction is worth restating explicitly: a CVE scanner cannot tell you whether a package is malicious. It can only tell you whether a legitimate package has a known vulnerability. A perfectly clean grype result does not mean a package is safe — it means it has no *known CVEs*. That's why both tool categories exist.
 
 We scan the SBOM rather than the live venv directory for a principled reason: the SBOM is a reproducible artifact. You can archive it and re-run grype against it in six months when new CVEs drop, without needing the original venv to still exist.
 
@@ -198,7 +247,7 @@ osv-scanner scan \
 
 ### 8. Bandit (static analysis)
 
-Bandit is a Python static analysis tool that reads source code and flags dangerous coding patterns — use of weak cryptography, shell injection risks, use of `eval()`, insecure deserialization, hardcoded credentials, and so on. It is not a CVE scanner. It doesn't care about version numbers or advisory databases. It reads the actual code and asks: _does this code do something dangerous?_
+Bandit is a Python static analysis tool that reads source code and flags dangerous coding patterns — use of weak cryptography, shell injection risks, use of `eval()`, insecure deserialization, hardcoded credentials, and so on. It is not a CVE scanner. It doesn't care about version numbers or advisory databases. It reads the actual code and asks: *does this code do something dangerous?*
 
 In this pipeline, bandit serves two purposes. First, it catches risky patterns in the package source that no CVE exists for yet — a maintainer might have introduced `subprocess.call(shell=True)` in the current version, and no advisory will exist until someone weaponizes it. Second, it gives you a code-level audit artifact that documents what you looked at.
 
@@ -223,11 +272,11 @@ bandit \
 
 ### 9. Guarddog (malicious package behavioral detection)
 
-This is the second threat class. Everything so far — grype, pip-audit, osv-scanner, bandit — operates on the assumption that the package is legitimate and asks whether it has problems. guarddog flips the question: _is this package itself an attack?_
+This is the second threat class. Everything so far — grype, pip-audit, osv-scanner, bandit — operates on the assumption that the package is legitimate and asks whether it has problems. guarddog flips the question: *is this package itself an attack?*
 
 It looks for behavioral indicators of malicious packages: network calls in setup code, obfuscated strings, environment variable exfiltration, C2 patterns, suspicious use of `install_requires` hooks, typosquatting signals, and more. It's the tool that would have caught packages like `colourama` (a typosquat of `colorama`) or packages that phone home on install.
 
-Because guarddog analyzes package behavior rather than installed files, you run it against the downloaded wheel/sdist artifacts in `dist/` rather than the installed venv. It's examining what the package _does_ when it arrives, not what it looks like after installation.
+Because guarddog analyzes package behavior rather than installed files, you run it against the downloaded wheel/sdist artifacts in `dist/` rather than the installed venv. It's examining what the package *does* when it arrives, not what it looks like after installation.
 
 ```bash
 guarddog pypi scan [PackageName] > [PackageName]-guarddog.txt
@@ -241,20 +290,20 @@ guarddog pypi scan [PackageName] > [PackageName]-guarddog.txt
 
 ### 10. Scorecard (supply chain health)
 
-Scorecard is different in character from everything that came before it. It doesn't scan for vulnerabilities or malicious behavior. It evaluates the _supply chain health_ of the upstream project. It asks questions like: does this project pin its own dependencies? Does it require code review? Does it use branch protection? Does it run SAST? Are its CI workflows hardened against injection attacks?
+Scorecard is different in character from everything that came before it. It doesn't scan for vulnerabilities or malicious behavior. It evaluates the *supply chain health* of the upstream project. It asks questions like: does this project pin its own dependencies? Does it require code review? Does it use branch protection? Does it run SAST? Are its CI workflows hardened against injection attacks?
 
 Grype tells you whether the current version is clean. Scorecard tells you whether you can trust the next version. It's a forward-looking signal.
 
 Scorecard queries GitHub's API, so it needs a token even for public repos — the one you set up during the pyvet bootstrap. It also operates on the upstream GitHub repository, not the local package.
 
 ```bash
-export GITHUB_AUTH_TOKEN=<your token>
+pyvet-auth   # loads GITHUB_AUTH_TOKEN into this shell (see GitHub Auth Token above)
 scorecard --repo=github.com/<org>/<repo> --show-details > [PackageName].scorecard
 ```
 
 | Flag | Why it's there |
 |---|---|
-| `export GITHUB_AUTH_TOKEN=<your token>` | Authenticates against the GitHub API. Without it you'll hit rate limits almost immediately, even against public repos. Source this from `~/.pyvet_env` (see [GitHub Auth Token](#github-auth-token)) rather than pasting the token inline. |
+| `pyvet-auth` | Loads `GITHUB_AUTH_TOKEN` into the current shell from the protected token file (see [GitHub Auth Token](#github-auth-token) above) right before it's needed, rather than keeping it live in every session. |
 | `--repo=github.com/<org>/<repo>` | The **upstream** GitHub repository for the package. Scorecard evaluates the project's source and CI configuration, not the local package artifacts. |
 | `--show-details` | Includes the full reason/detail breakdown for every check, not just the numeric score. A bare score with no supporting detail isn't auditable — this is what makes the output usable as a findings-record artifact. |
 | `> [PackageName].scorecard` | Redirects output to a file for archiving alongside the SBOM and other findings. |
@@ -265,17 +314,38 @@ Each package gets one of three outcomes: **Go**, **Conditional Go**, or **No-Go*
 
 | Finding | Outcome |
 |---|---|
-| Any guarddog malicious-behavior indicator | **No-Go**, no exceptions, regardless of every other result. This is the one category where a single positive finding overrides everything else. |
-| Critical or High CVE (grype / pip-audit / osv-scanner) on an in-scope package, with no fix available | **No-Go** until a patched version exists — then re-vet the patched version from Step 1. |
-| Critical or High CVE with a fix available, or any CVE confined to bootstrap tooling (e.g. `pip` itself) that isn't part of the vetted closure | **Conditional Go** — approved, with the finding documented in the verdict record. |
-| Medium/Low CVE, or a Bandit finding at medium severity/confidence in package source | **Conditional Go** — documented, not blocking. High-severity, high-confidence Bandit findings get analyst review before Go. |
-| Low Scorecard aggregate score | **Advisory only.** Scorecard doesn't gate the current version — it informs how aggressively you re-vet future versions of that dependency. |
+| **Any guarddog malicious-behavior indicator** | **No-Go**, no exceptions, regardless of every other result. This is the one category where a single positive finding overrides everything else. |
+| **Critical or High CVE** (grype / pip-audit / osv-scanner) on an in-scope package, with no fix available | **No-Go** until a patched version exists — then re-vet the patched version from Step 1. |
+| **Critical or High CVE with a fix available**, or any CVE confined to bootstrap tooling (e.g. `pip` itself) that isn't part of the vetted closure | **Conditional Go** — approved, with the finding documented in the verdict record. |
+| **Medium/Low CVE**, or a Bandit finding at medium severity/confidence in package source | **Conditional Go** — documented, not blocking. High-severity, high-confidence Bandit findings get analyst review before Go. |
+| **Low Scorecard aggregate score** | **Advisory only.** Scorecard doesn't gate the current version — it informs how aggressively you re-vet future versions of that dependency. |
 
-**Sign-off.** The analyst who ran the pipeline documents the findings from Steps 4–10 in a verdict record and a second reviewer (security engineer or team lead) countersigns before the package is released across the air gap. At minimum, the verdict record includes: package name and pinned version, SBOM reference, a summary of each tool's findings, any divergence between scanners and how it was resolved, the final decision (Go / Conditional Go / No-Go), and the analyst's and reviewer's names and date.
+**Sign-off.** The analyst who ran the pipeline documents the findings from Steps 4–10 in a verdict record and a second reviewer (security engineer or team lead) countersigns before the package is released across the air gap. At minimum, the verdict record includes: package name and pinned version, SBOM reference, a summary of each tool's findings, any divergence between scanners and how it was resolved, the final decision (Go / Conditional Go / No-Go), and the analyst's and reviewer's names and date. Use the [verdict record template](#verdict-record-template-docs) in `docs/` to capture this.
 
 #### A Note on Scanner Disagreement
 
 When grype and pip-audit agree, especially on in-scope packages, you have corroborated confidence. When they disagree, you don't average them or pick the friendlier answer. You document the divergence, note the specific advisories grype surfaced, and let the analyst make a call. In the PyYAML run below, the disagreement was on bootstrap tooling and all grype findings were already in a "fixed" state, so the verdict was unaffected — but the divergence itself still goes in the findings record.
+
+---
+
+## Verdict Record Template (`docs/`)
+
+Every vetted package gets its own filled-out copy of the verdict record — this is the artifact a reviewer countersigns and the artifact that gets archived alongside the SBOM and scan output. The template lives in two equivalent formats in `docs/`:
+
+| File | Use when |
+| --- | --- |
+| [`docs/PythonVettingTemplate.md`](docs/PythonVettingTemplate.md) | You want to fill it out in a text editor / commit it to a git-tracked findings repo, or paste it straight into an issue or wiki page. Renders natively on GitHub/GitLab. |
+| [`docs/PythonVettingTemplate.docx`](docs/PythonVettingTemplate.docx) | Your review/sign-off workflow expects a Word doc (e.g. for a reviewer's physical or digital signature, or to match existing org paperwork). |
+
+**How to use it:**
+
+1. Copy the template — don't edit it in place. Name the copy after the package and version, e.g. `PyYAML-6.0.3-verdict.md`, and store it with that package's findings (SBOM, `grype.json`, `pip-audit.json`, `osv.json`, `bandit.json`, `*-guarddog.txt`, `*.scorecard`).
+2. Fill in **Package Information** as soon as the request comes in — before you start scanning.
+3. Work through the numbered sections in order as you complete each step of [The Process](#the-process); each section in the template maps 1:1 to a numbered step above (Section 4 = SBOM, Section 5 = grype, and so on).
+4. Update the **Findings Dashboard** summary table last, once all ten steps are complete — it's a quick-scan rollup, not something you fill in live.
+5. Write the **Analyst Rationale** and **Divergence / Notes** in Section 11 referencing specific findings, then mark the **Final Decision** checkbox and get the reviewer's countersignature before the package crosses the air gap.
+
+The both-formats setup is deliberate: the Markdown version is diffable and reviewable in a pull request if your findings records live in git; the `.docx` version exists for teams whose sign-off process is anchored in Word/paper.
 
 ---
 
@@ -430,7 +500,7 @@ error: uninstall-no-record-file
 hint: The package was installed by debian. You should check if it can uninstall the package.
 ```
 
-The command ran pip — but _which_ pip? The system pip, or your pyvet venv's pip. Because you used `--prefix` rather than activating the new venv, pip was still operating with system-level site-package awareness. It saw that PyYAML 6.0.2 was already installed (by Debian's package manager, apt), decided it needed to uninstall the old version before installing 6.0.3, and then discovered it couldn't — because apt-managed packages don't have a pip RECORD file. Debian owns that package; pip can't touch it.
+The command ran pip — but *which* pip? The system pip, or your pyvet venv's pip. Because you used `--prefix` rather than activating the new venv, pip was still operating with system-level site-package awareness. It saw that PyYAML 6.0.2 was already installed (by Debian's package manager, apt), decided it needed to uninstall the old version before installing 6.0.3, and then discovered it couldn't — because apt-managed packages don't have a pip RECORD file. Debian owns that package; pip can't touch it.
 
 The fix is simple: **use the venv's own pip binary directly**, not the ambient pip on your PATH. The venv's pip operates entirely within the venv's isolated site-packages and has no visibility into system-installed packages. It won't try to uninstall anything from outside its own prefix.
 
@@ -576,7 +646,7 @@ The filter did exactly what it was designed to do. These findings did not pollut
 
 **What to do about the pip findings.** You don't block on them, but you don't silently drop them either. Two actions:
 
-First, document them in the verdict as a bootstrap finding: _pip 25.1.1 in the venv bootstrap has 5 known CVEs (4 Medium, 1 Low), all fixed in later versions. These are not part of the vetted closure and do not affect the PyYAML verdict._
+First, document them in the verdict as a bootstrap finding: *pip 25.1.1 in the venv bootstrap has 5 known CVEs (4 Medium, 1 Low), all fixed in later versions. These are not part of the vetted closure and do not affect the PyYAML verdict.*
 
 Second, note operationally that the venv's pip is behind. When you transfer packages to the air-gapped enclave, the venv pip version comes along for the ride. Whether you care depends on whether pip ever runs in the enclave post-transfer — if you're just installing from pre-vetted wheels with no network access, pip's network-facing vulnerability surface is zero. Still worth tracking.
 
@@ -675,7 +745,7 @@ Found 0 potentially malicious indicators scanning pyyaml
 ### 10. Scorecard (supply chain health)
 
 ```bash
-export GITHUB_AUTH_TOKEN=<your token>
+pyvet-auth
 scorecard --repo=github.com/yaml/pyyaml --show-details > pyyaml-scorecard.txt
 cat pyyaml-scorecard.txt
 ```
